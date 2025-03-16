@@ -1,134 +1,275 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # Disable GPU for TensorFlow
-
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import matplotlib.pyplot as plt
 from collections import Counter
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
-from torch.nn.utils.rnn import pad_sequence
+import time
 
-# ✅ Use CPU to prevent memory issues
+# ✅ Maximize CPU utilization
+torch.set_num_threads(os.cpu_count())
 device = torch.device("cpu")
 
-# ✅ Load dataset
+# ✅ Load dataset with optimized reading
 file_path = "/home/fahad/LSTM1/combined_data.csv"
-df = pd.read_csv(file_path)
-
-# ✅ Encode labels (Spam = 1, Ham = 0)
+df = pd.read_csv(file_path, usecols=['text', 'label'])  # Only load needed columns
 df['label'] = df['label'].astype(int)
 
-# ✅ Tokenization and Vocabulary Building
+# ✅ More efficient vocabulary building
 def tokenize(text):
     return text.lower().split()
 
-def build_vocab(texts, min_freq=2):  # Reduce vocab size
-    counter = Counter()
-    for text in texts:
-        counter.update(tokenize(text))
-    vocab = {word: i+2 for i, (word, count) in enumerate(counter.items()) if count >= min_freq}
-    vocab["<unk>"] = 0  # Unknown tokens
-    vocab["<pad>"] = 1  # Padding
+def build_vocab(texts, min_freq=2, max_vocab=15000):
+    all_tokens = [token for text in texts for token in tokenize(text)]
+    counter = Counter(all_tokens)
+    
+    # Limit vocabulary size
+    vocab = {word: i + 2 for i, (word, count) in enumerate(
+        counter.most_common(max_vocab)) if count >= min_freq}
+    vocab["<unk>"] = 0
+    vocab["<pad>"] = 1
     return vocab
 
 vocab = build_vocab(df['text'])
-vocab_size = len(vocab) + 2  # Ensure correct vocab size
+vocab_size = len(vocab)
+print(f"Vocabulary size: {vocab_size}")
 
-# ✅ Convert text data to sequences
+# ✅ Optimize sequence processing with vectorized operations
 def text_pipeline(text):
     return [vocab.get(token, vocab["<unk>"]) for token in tokenize(text)]
 
-sequences = [text_pipeline(text) for text in df['text']]
+# ✅ Process all sequences at once for better efficiency
+sequences = [text_pipeline(txt) for txt in df['text']]
 
-# ✅ Pad sequences
-max_len = 40  # Reduce max email length to lower memory usage
-padded_sequences = pad_sequence([torch.tensor(seq[:max_len]) for seq in sequences], batch_first=True, padding_value=vocab["<pad>"])
+# ✅ Optimize sequence length (speed vs accuracy tradeoff)
+max_len = min(max(len(seq) for seq in sequences), 35)  # Slightly reduced
 
-# ✅ Convert to tensors
-X = padded_sequences.to(device)
+# ✅ More efficient padding
+padded_sequences = []
+for seq in sequences:
+    # Truncate and pad in one operation
+    padded_seq = seq[:max_len] + [vocab["<pad>"]] * (max_len - min(len(seq), max_len))
+    padded_sequences.append(padded_seq)
+
+X = torch.tensor(padded_sequences, dtype=torch.long).to(device)
 Y = torch.tensor(df['label'].values, dtype=torch.float32).to(device)
 
-# ✅ Split into training and testing sets
-X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.2, random_state=42)
+# ✅ Split dataset
+X_train, X_test, Y_train, Y_test = train_test_split(
+    X, Y, test_size=0.2, random_state=42
+)
 
-# ✅ Create DataLoader for batching
-batch_size = 8  # Reduce batch size further to lower memory usage
+# ✅ Optimize DataLoader for CPU
+batch_size = 128  # Increased batch size
 train_data = TensorDataset(X_train, Y_train)
 test_data = TensorDataset(X_test, Y_test)
-train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
-test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=False)
 
-# ✅ Define the LSTM model for text classification
-class SpamLSTM(nn.Module):
-    def __init__(self, vocab_size, embed_size=32, hidden_size=32, num_layers=1, output_size=1):  # Further reduced complexity
-        super(SpamLSTM, self).__init__()
+train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, 
+                         num_workers=0, pin_memory=False)  # No workers for CPU
+test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=False, 
+                        num_workers=0, pin_memory=False)
+
+# ✅ Optimized LSTM Model
+class OptimizedSpamLSTM(nn.Module):
+    def __init__(self, vocab_size, embed_size=24, hidden_size=24, num_layers=1, output_size=1, dropout=0.2):
+        super(OptimizedSpamLSTM, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embed_size, padding_idx=1)
-        self.lstm = nn.LSTM(embed_size, hidden_size, num_layers, batch_first=True)
+        
+        # Use batch_first=True for more efficient processing
+        self.lstm = nn.LSTM(
+            embed_size, 
+            hidden_size, 
+            num_layers,
+            batch_first=True,
+            bidirectional=False,  # Unidirectional is faster
+            dropout=0 if num_layers == 1 else dropout
+        )
+        
         self.fc = nn.Linear(hidden_size, output_size)
+        self.dropout = nn.Dropout(dropout)
         self.sigmoid = nn.Sigmoid()
-
+        self.vocab_size = vocab_size
+        
     def forward(self, x):
-        x = torch.clamp(x, 0, vocab_size - 1)  # Ensure indices are within range
+        # Ensure token indices are valid
+        x = torch.clamp(x, 0, self.vocab_size - 1)
+        
+        # Get embeddings
         x = self.embedding(x)
-        h0 = torch.zeros(1, x.size(0), 32).to(device)
-        c0 = torch.zeros(1, x.size(0), 32).to(device)
-        out, _ = self.lstm(x, (h0, c0))
-        out = self.fc(out[:, -1, :])
+        x = self.dropout(x)
+        
+        # Process with LSTM - use return_packed=False for better performance on CPU
+        lstm_out, _ = self.lstm(x)
+        
+        # Use only the last output and apply dropout
+        last_out = lstm_out[:, -1, :]
+        last_out = self.dropout(last_out)
+        
+        # Final classification
+        out = self.fc(last_out)
         return self.sigmoid(out)
 
-# ✅ Initialize model
-model = SpamLSTM(vocab_size=vocab_size).to(device)
-criterion = nn.BCELoss()  # Binary classification loss
-optimizer = optim.Adam(model.parameters(), lr=0.0005)
+# ✅ Initialize Model
+model = OptimizedSpamLSTM(
+    vocab_size=vocab_size,
+    embed_size=24,     # Reduced from 32
+    hidden_size=24,    # Reduced from 32
+    num_layers=1,
+    dropout=0.2        # Added dropout for better generalization
+).to(device)
 
-# ✅ Train the LSTM model
-def train_model():
-    epochs = 3  # Further reduce epochs for efficiency
+# Try to optimize with JIT
+try:
+    model = torch.jit.script(model)
+    print("✅ Model optimized with JIT compilation")
+except Exception as e:
+    print(f"JIT compilation not available: {e}")
+
+# ✅ Optimized training
+criterion = nn.BCELoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)  # Adjusted
+
+# ✅ Use learning rate scheduler for faster convergence
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='min', factor=0.5, patience=1, verbose=True
+)
+
+# ✅ Train with performance tracking and early stopping
+def train_model(epochs=3, patience=2):
+    model.train()
+    best_loss = float('inf')
+    patience_counter = 0
+    
+    print("Starting training...")
+    total_start_time = time.time()
+    
     for epoch in range(epochs):
-        model.train()
+        epoch_start = time.time()
         total_loss = 0
+        batch_count = 0
         
         for inputs, labels in train_loader:
-            optimizer.zero_grad()
+            batch_start = time.time()
+            
+            optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
+            
             outputs = model(inputs).squeeze()
             loss = criterion(outputs, labels)
             loss.backward()
+            
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
+            
+            batch_time = time.time() - batch_start
             total_loss += loss.item()
+            batch_count += 1
+            
+            if batch_count % 20 == 0:
+                print(f"Batch {batch_count}/{len(train_loader)}, "
+                      f"Loss: {loss.item():.4f}, Time: {batch_time:.3f}s")
         
-        print(f"Epoch [{epoch+1}/{epochs}], Loss: {total_loss/len(train_loader):.6f}")
-    torch.save(model.state_dict(), "spam_lstm_model.pth")
-    print("✅ Model saved as 'spam_lstm_model.pth'")
+        avg_loss = total_loss / len(train_loader)
+        epoch_time = time.time() - epoch_start
+        
+        print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.6f}, Time: {epoch_time:.2f}s")
+        
+        # Update learning rate based on performance
+        scheduler.step(avg_loss)
+        
+        # Early stopping logic
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), "optimized_spam_lstm.pth")
+            print(f"✅ Model improved, saved at epoch {epoch+1}")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch+1}")
+                break
+    
+    total_time = time.time() - total_start_time
+    print(f"✅ Training completed in {total_time:.2f} seconds")
 
-# ✅ Evaluate the model
+# ✅ Evaluate Model
 def evaluate_model():
     model.eval()
-    correct, total = 0, 0
-    predictions, actual_labels = [], []
+    correct = 0
+    total = 0
+    all_predictions = []
+    all_labels = []
+    
+    print("\nStarting evaluation...")
+    eval_start = time.time()
     
     with torch.no_grad():
         for inputs, labels in test_loader:
             outputs = model(inputs).squeeze()
             predicted = (outputs > 0.5).float()
+            
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
-            predictions.extend(predicted.cpu().numpy())
-            actual_labels.extend(labels.cpu().numpy())
+            
+            all_predictions.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
     
+    eval_time = time.time() - eval_start
     accuracy = correct / total
-    print(f"\n✅ Model Accuracy: {accuracy:.4f}")
+    
+    print(f"Evaluation completed in {eval_time:.2f} seconds")
+    print(f"✅ Model Accuracy: {accuracy:.4f}")
+
+    # Calculate metrics and create a simple confusion matrix
+    true_positives = sum((p == 1 and l == 1) for p, l in zip(all_predictions, all_labels))
+    false_positives = sum((p == 1 and l == 0) for p, l in zip(all_predictions, all_labels))
+    true_negatives = sum((p == 0 and l == 0) for p, l in zip(all_predictions, all_labels))
+    false_negatives = sum((p == 0 and l == 1) for p, l in zip(all_predictions, all_labels))
+    
+    precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
+    recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+    
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1 Score: {f1:.4f}")
+    
     results_df = pd.DataFrame({
-        "Actual Label": actual_labels,
-        "Predicted Label": predictions
+        "Actual": all_labels,
+        "Predicted": all_predictions
     })
-    results_df.to_csv("spam_predictions.csv", index=False)
-    print("✅ Predictions saved to 'spam_predictions.csv'.")
+    results_df.to_csv("optimized_spam_lstm_predictions.csv", index=False)
+    print("✅ Predictions saved to 'optimized_spam_lstm_predictions.csv'")
+
+# ✅ Inference function for production
+def predict_single(text, model_path="optimized_spam_lstm.pth"):
+    # Load the saved model for inference
+    loaded_model = OptimizedSpamLSTM(vocab_size=vocab_size).to(device)
+    loaded_model.load_state_dict(torch.load(model_path))
+    loaded_model.eval()
+    
+    # Process the text
+    tokenized = text_pipeline(text)
+    padded = tokenized[:max_len] + [vocab["<pad>"]] * (max_len - min(len(tokenized), max_len))
+    input_tensor = torch.tensor([padded], dtype=torch.long).to(device)
+    
+    # Make prediction
+    with torch.no_grad():
+        output = loaded_model(input_tensor).item()
+    
+    is_spam = output > 0.5
+    return {"is_spam": bool(is_spam), "confidence": output}
 
 # ✅ Run Training and Evaluation
 if __name__ == "__main__":
-    train_model()
+    train_model(epochs=3)
     evaluate_model()
+    
+    # Example of predicting on a single text
+    sample_text = "Congratulations! You've won a free gift card. Click here to claim your prize now!"
+    result = predict_single(sample_text)
+    print(f"\nSample spam check: {result}")
